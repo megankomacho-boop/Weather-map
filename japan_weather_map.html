@@ -1,0 +1,274 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>日本の明日の天気・標高・水深</title>
+
+<!-- Leafletの地図表示用CSS -->
+<link rel="stylesheet"
+ href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<style>
+body {
+    margin: 0;
+    font-family: sans-serif;
+}
+#map {
+    width: 100%;
+    height: 85vh;
+}
+#info {
+    padding: 12px;
+    font-size: 16px;
+}
+#result {
+    margin-top: 8px;
+    line-height: 1.6;
+}
+</style>
+</head>
+
+<body>
+
+<div id="info">
+<b>地図上をクリックすると、明日の天気・標高・海底水深を表示します</b>
+<div id="result">地点を選択してください</div>
+</div>
+
+<div id="map"></div>
+
+<!-- LeafletのJavaScriptライブラリ -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+// =====================================
+// ① 日本地図（国土地理院）
+// =====================================
+const map = L.map('map').setView(
+    [35.658581, 139.745433], 14
+);
+
+// 国土地理院から日本地図の画像を取得する
+L.tileLayer(
+ 'https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
+ {
+  attribution: '地理院タイル',
+  maxZoom: 18
+ }
+).addTo(map);
+
+// 初期地点：東京タワー
+L.marker([35.658581, 139.745433])
+ .addTo(map)
+ .bindPopup('東京タワー');
+
+let marker = null;
+let requestId = 0;
+
+// =====================================
+// ② 天気コードを日本語に変換
+// =====================================
+function weatherName(code) {
+    if (code === 0) return '快晴';
+    if (code === 1) return '晴れ';
+    if (code === 2) return '一部曇り';
+    if (code === 3) return '曇り';
+    if ([45,48].includes(code)) return '霧';
+    if ([51,53,55,56,57].includes(code)) return '霧雨';
+    if ([61,63,65,66,67].includes(code)) return '雨';
+    if ([71,73,75,77].includes(code)) return '雪';
+    if ([80,81,82].includes(code)) return 'にわか雨';
+    if ([85,86].includes(code)) return 'にわか雪';
+    if ([95,96,99].includes(code)) return '雷雨';
+    return '不明';
+}
+
+// =====================================
+// ③ 明日の天気を取得
+// =====================================
+async function getWeather(lat, lon) {
+
+    // Open-MeteoのWeb APIから明日の天気を取得する
+    // 取得データ：天気、最高気温、最低気温、最大降水確率
+    // データ形式：JSON
+    const url =
+      'https://api.open-meteo.com/v1/forecast'
+      + '?latitude=' + lat
+      + '&longitude=' + lon
+      + '&daily=weather_code,temperature_2m_max,'
+      + 'temperature_2m_min,precipitation_probability_max'
+      + '&timezone=auto'
+      + '&forecast_days=2';
+
+    // キャッシュを使わずに取得
+    const response = await fetch(url, {
+        mode: 'cors',
+        cache: 'no-store'
+    });
+
+    if (!response.ok) {
+        throw new Error('HTTP ' + response.status);
+    }
+
+    const data = await response.json();
+
+    if (!data.daily || data.daily.time.length < 2) {
+        throw new Error('予報データがありません');
+    }
+
+    // 配列の0番目は今日、1番目は明日
+    return {
+        date: data.daily.time[1],
+        weather: weatherName(data.daily.weather_code[1]),
+        max: data.daily.temperature_2m_max[1],
+        min: data.daily.temperature_2m_min[1],
+        rain: data.daily.precipitation_probability_max[1]
+    };
+}
+
+// =====================================
+// ④ GEBCOから標高・海底水深を取得
+// =====================================
+async function getGEBCO(lat, lon) {
+
+    const delta = 0.01;
+
+    // GEBCOの地形データを問い合わせる条件
+    const params = new URLSearchParams({
+        SERVICE: 'WMS',
+        VERSION: '1.3.0',
+        REQUEST: 'GetFeatureInfo',
+        LAYERS: 'GEBCO_LATEST_2_sub_ice_topo',
+        QUERY_LAYERS: 'GEBCO_LATEST_2_sub_ice_topo',
+        CRS: 'EPSG:4326',
+        BBOX: [
+            lat-delta, lon-delta,
+            lat+delta, lon+delta
+        ].join(','),
+        WIDTH: '101',
+        HEIGHT: '101',
+        I: '50',
+        J: '50',
+        INFO_FORMAT: 'text/plain'
+    });
+
+    // GEBCOから標高・海底水深を取得する
+    // 取得データ：海面を基準とした高さ（m）
+    // プラス：標高、マイナス：海底の深さ
+    // データ形式：テキスト
+    const url =
+      'https://wms.gebco.net/mapserv?'
+      + params.toString();
+
+    const response = await fetch(url, {
+        mode: 'cors',
+        cache: 'no-store'
+    });
+
+    if (!response.ok) {
+        throw new Error('GEBCO HTTP ' + response.status);
+    }
+
+    const text = await response.text();
+
+    // value_listから数値を取り出す
+    const match = text.match(
+      /value_list\s*=\s*['"]?\s*(-?\d+(?:\.\d+)?)/i
+    );
+
+    if (!match) {
+        throw new Error('標高データを読み取れません');
+    }
+
+    return Number(match[1]);
+}
+
+// =====================================
+// ⑤ 標高・水深を日本語で表示
+// =====================================
+function heightName(value) {
+
+    if (value < 0) {
+        return '海底の水深：約'
+          + Math.abs(value).toLocaleString() + ' m';
+    }
+
+    return '標高：約'
+      + value.toLocaleString() + ' m';
+}
+
+// =====================================
+// ⑥ 地図をクリックしたときの処理
+// =====================================
+map.on('click', async function(e) {
+
+    // クリックした地点の緯度・経度
+    const lat = e.latlng.lat;
+    const lon = e.latlng.lng;
+    const currentId = ++requestId;
+
+    if (marker) {
+        map.removeLayer(marker);
+    }
+
+    marker = L.marker([lat, lon]).addTo(map);
+    const currentMarker = marker;
+
+    const resultBox = document.getElementById('result');
+
+    resultBox.textContent =
+        '明日の天気・標高・水深を取得中...';
+
+    // 2つのWeb APIから並行してデータを取得
+    const [weatherResult, heightResult] =
+      await Promise.allSettled([
+          getWeather(lat, lon),
+          getGEBCO(lat, lon)
+      ]);
+
+    // 続けて別の地点をクリックした場合の対策
+    if (currentId !== requestId) return;
+
+    let result =
+        '緯度: ' + lat.toFixed(6)
+        + '　経度: ' + lon.toFixed(6);
+
+    // 明日の天気を表示
+    if (weatherResult.status === 'fulfilled') {
+
+        const w = weatherResult.value;
+
+        result +=
+          '　日付: ' + w.date
+          + '　天気: ' + w.weather
+          + '　最高気温: ' + w.max + ' ℃'
+          + '　最低気温: ' + w.min + ' ℃'
+          + '　最大降水確率: '
+          + (w.rain == null ? '不明' : w.rain + ' %');
+
+    } else {
+
+        result += '　天気取得エラー: '
+          + weatherResult.reason.message;
+    }
+
+    // 標高・水深を表示
+    if (heightResult.status === 'fulfilled') {
+
+        result += '　'
+          + heightName(heightResult.value);
+
+    } else {
+
+        result += '　標高・水深取得エラー: '
+          + heightResult.reason.message;
+    }
+
+    resultBox.textContent = result;
+    currentMarker.bindPopup(result).openPopup();
+});
+</script>
+</body>
+</html>
